@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">VishGuard AI</string>
+    <string name="fgs_justification">VishGuard provides real-time protection against vishing by analyzing call metadata and showing a security overlay.</string>
+</resources>
