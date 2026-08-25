@@ -9,7 +9,9 @@ import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.LayoutInflater
@@ -21,6 +23,9 @@ import androidx.core.app.NotificationCompat
 import com.google.gson.Gson
 import com.vishguard.ai.R
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.IOException
 
 data class VishingResponse(
     val nivel_riesgo: String?,
@@ -31,26 +36,46 @@ data class VishingResponse(
 class OverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
-    private lateinit var overlayView: View
+    private var overlayView: View? = null
     private lateinit var container: LinearLayout
     private lateinit var tvShieldStatus: TextView
     private lateinit var tvScore: TextView
     private lateinit var tvRecommendation: TextView
 
-    private var webSocket: WebSocket? = null
     private val client = OkHttpClient()
     private val gson = Gson()
+    private val TAG = "VishGuardHTTP"
+
+    companion object {
+        const val EXTRA_TEXTO = "extra_texto_llamada"
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        Log.d(TAG, "🚀 [ANDROID LOG]: Servicio OverlayService creado correctamente.")
         startForegroundServiceNotification()
         setupOverlayWindow()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        connectWebSocket()
+        val textoRecibido = intent?.getStringExtra(EXTRA_TEXTO)
+
+        if (!textoRecibido.isNullOrBlank()) {
+            Log.d(TAG, "📞 [ANDROID LOG]: Frase enviada para análisis: \"$textoRecibido\"")
+            enviarTextoParaAnalizar(textoRecibido)
+        } else {
+            // Al iniciar por primera vez, el estado inicial es SEGURO (0%)
+            Log.d(TAG, "🛡️ [ANDROID LOG]: Protección activa. Estado inicial: SEGURO (0%).")
+            updateOverlayUI(
+                VishingResponse(
+                    nivel_riesgo = "BAJO",
+                    score = 0,
+                    recomendacion = "Escaneando llamada... No se detectan amenazas."
+                )
+            )
+        }
         return START_STICKY
     }
 
@@ -68,7 +93,7 @@ class OverlayService : Service() {
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("VishGuard AI Activo")
-            .setContentText("Protección de llamadas activada")
+            .setContentText("Escaneando llamada en tiempo real...")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .build()
 
@@ -80,13 +105,16 @@ class OverlayService : Service() {
     }
 
     private fun setupOverlayWindow() {
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        overlayView = LayoutInflater.from(this).inflate(R.layout.overlay_layout, null)
+        if (overlayView != null) return
 
-        container = overlayView.findViewById(R.id.overlayContainer)
-        tvShieldStatus = overlayView.findViewById(R.id.tvShieldStatus)
-        tvScore = overlayView.findViewById(R.id.tvScore)
-        tvRecommendation = overlayView.findViewById(R.id.tvRecommendation)
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val inflater = LayoutInflater.from(this)
+        overlayView = inflater.inflate(R.layout.overlay_layout, null)
+
+        container = overlayView!!.findViewById(R.id.overlayContainer)
+        tvShieldStatus = overlayView!!.findViewById(R.id.tvShieldStatus)
+        tvScore = overlayView!!.findViewById(R.id.tvScore)
+        tvRecommendation = overlayView!!.findViewById(R.id.tvRecommendation)
 
         val layoutParamsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -107,83 +135,92 @@ class OverlayService : Service() {
         params.y = 100
 
         windowManager.addView(overlayView, params)
+        Log.d(TAG, "🎨 [ANDROID LOG]: Tarjeta Flotante (Overlay) inflada y colocada en pantalla.")
     }
 
-    private fun connectWebSocket() {
-        webSocket?.close(1000, "Reconectando...")
+    // 🚀 Petición HTTP POST con Logs hacia FastAPI
+    fun enviarTextoParaAnalizar(textoLlamada: String) {
+        val urlServer = "http://localhost:8000/analizar-llamada"
+        Log.i(TAG, "🌐 [ANDROID LOG]: Conectando a $urlServer...")
+        Log.i(TAG, "📤 [ENVIANDO TEXTO]: \"$textoLlamada\"")
 
-        // Mantenemos tu IP configurada original para conectar con tu backend
-        val request = Request.Builder().url("ws://10.0.2.2:8000/ws/stream").build()
+        // Feedback inmediato en pantalla mientras responde la IA
+        Handler(Looper.getMainLooper()).post {
+            tvShieldStatus.text = "🔍 Analizando intención..."
+            tvRecommendation.text = "Procesando mensaje con el cerebro de IA..."
+        }
 
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d("VishGuardWS", "✅ Pixel 8 Conectado al WebSocket!")
+        val jsonBody = mapOf("texto" to textoLlamada)
+        val bodyString = gson.toJson(jsonBody)
+        val body = bodyString.toRequestBody("application/json; charset=utf-8".toMediaType())
+
+        val request = Request.Builder()
+            .url(urlServer)
+            .post(body)
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e(TAG, "❌ [ANDROID LOG ERROR]: Falló la conexión con el servidor: ${e.message}")
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                super.onMessage(webSocket, text)
-                Log.d("VishGuardWS", "📩 Mensaje recibido: $text")
+            override fun onResponse(call: Call, response: Response) {
+                val responseData = response.body?.string()
+                if (response.isSuccessful && responseData != null) {
+                    Log.d(TAG, "✅ [ANDROID LOG]: ¡Conexión Exitosa con la PC! Respuesta recibida:")
+                    Log.d(TAG, "📩 [JSON RECIBIDO]: $responseData")
 
-                try {
-                    // Procesamos el JSON recibido usando Gson directamente hacia el data class
-                    val responseData = gson.fromJson(text, VishingResponse::class.java)
-                    if (responseData != null) {
-                        // Actualizamos la interfaz gráfica de forma segura en pantalla
-                        updateOverlayUI(responseData)
+                    try {
+                        val resultado = gson.fromJson(responseData, VishingResponse::class.java)
+                        if (resultado != null) {
+                            updateOverlayUI(resultado)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "❌ [ANDROID LOG ERROR]: Error al mapear el JSON: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    Log.e("VishGuardWS", "❌ Error al parsear JSON con Gson: ${e.message}")
-                    e.printStackTrace()
+                } else {
+                    Log.e(TAG, "⚠️ [ANDROID LOG ERROR]: Servidor respondió con código de error: ${response.code}")
                 }
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e("VishGuardWS", "❌ Error en Pixel 8: ${t.message}")
-                // Intenta reconectar cada 3 segundos si el servidor se interrumpió
-                overlayView.postDelayed({ connectWebSocket() }, 3000)
             }
         })
     }
 
     private fun updateOverlayUI(data: VishingResponse) {
-        // 📌 Forzamos explícitamente que la actualización gráfica corra en el Hilo Principal de Android
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            try {
-                val score = data.score ?: 0
-                tvScore.text = "$score%"
-                tvRecommendation.text = data.recomendacion ?: "Analizando..."
+        Handler(Looper.getMainLooper()).post {
+            val score = data.score ?: 0
+            val nivel = data.nivel_riesgo?.uppercase() ?: "PELIGROSO"
 
-                val riesgo = data.nivel_riesgo?.uppercase() ?: "BAJO"
-                Log.d("VishGuardUI", "🎨 Actualizando UI a nivel de riesgo: $riesgo")
+            Log.i(TAG, "🎨 [ANDROID LOG]: Actualizando Interfaz Móvil -> Riesgo: $nivel | Score: $score%")
 
-                when (riesgo) {
-                    "BAJO", "SEGURO" -> {
-                        container.setBackgroundColor(Color.parseColor("#2E7D32")) // Verde 🟢
-                        tvShieldStatus.text = "🛡️ Llamada Segura"
-                    }
-                    "MEDIO", "SOSPECHOSO" -> {
-                        container.setBackgroundColor(Color.parseColor("#E65100")) // Naranja 🟠
-                        tvShieldStatus.text = "⚠️ Sospecha Detectada"
-                    }
-                    "PELIGROSO", "FRAUDE", "CRITICO" -> {
-                        container.setBackgroundColor(Color.parseColor("#C62828")) // Rojo 🛑
-                        tvShieldStatus.text = "🛑 ALERTA DE FRAUDE"
-                    }
-                    else -> {
-                        container.setBackgroundColor(Color.parseColor("#2E7D32"))
-                        tvShieldStatus.text = "🛡️ VishGuard Activo"
-                    }
+            tvScore.text = "$score%"
+            tvRecommendation.text = data.recomendacion ?: "Analizando llamada..."
+
+            when (nivel) {
+                "BAJO", "SEGURO" -> {
+                    container.setBackgroundColor(Color.parseColor("#2E7D32")) // Verde 🟢
+                    tvShieldStatus.text = "🛡️ Llamada Segura"
                 }
-            } catch (e: Exception) {
-                Log.e("VishGuardUI", "❌ Error actualizando la interfaz: ${e.message}")
+                "MEDIO", "SOSPECHOSO" -> {
+                    container.setBackgroundColor(Color.parseColor("#E65100")) // Naranja 🟠
+                    tvShieldStatus.text = "⚠️ Sospecha Detectada"
+                }
+                "PELIGROSO", "FRAUDE" -> {
+                    container.setBackgroundColor(Color.parseColor("#C62828")) // Rojo 🛑
+                    tvShieldStatus.text = "🛑 ALERTA DE FRAUDE"
+                }
+                else -> {
+                    container.setBackgroundColor(Color.parseColor("#C62828"))
+                    tvShieldStatus.text = "🛑 ALERTA DE FRAUDE"
+                }
             }
         }
     }
+
     override fun onDestroy() {
         super.onDestroy()
-        webSocket?.close(1000, "Servicio Detenido")
-        if (::overlayView.isInitialized) {
-            windowManager.removeView(overlayView)
+        overlayView?.let {
+            windowManager.removeView(it)
+            overlayView = null
         }
     }
 }
