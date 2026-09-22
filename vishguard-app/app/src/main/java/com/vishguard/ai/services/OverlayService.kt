@@ -26,11 +26,16 @@ import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
+// Data class ajustada para mapear la respuesta de Groq / Heurística local
 data class VishingResponse(
-    val nivel_riesgo: String?,
-    val score: Int?,
-    val recomendacion: String?
+    val nivel_riesgo: String? = null,
+    val color: String? = null,
+    val mensaje_alerta: String? = null,
+    val recomendacion: String? = null,
+    val patron_detectado: String? = null,
+    val score: Int? = 0
 )
 
 class OverlayService : Service() {
@@ -42,7 +47,13 @@ class OverlayService : Service() {
     private lateinit var tvScore: TextView
     private lateinit var tvRecommendation: TextView
 
-    private val client = OkHttpClient()
+    // ⏱️ Cliente HTTP configurado con Timeouts extendidos para la fase de pruebas
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS) // Conexión a la red local
+        .readTimeout(15, TimeUnit.SECONDS)    // Tiempo de espera para la inferencia de la IA
+        .writeTimeout(15, TimeUnit.SECONDS)   // Envío de la petición
+        .build()
+
     private val gson = Gson()
     private val TAG = "VishGuardHTTP"
 
@@ -66,13 +77,13 @@ class OverlayService : Service() {
             Log.d(TAG, "📞 [ANDROID LOG]: Frase enviada para análisis: \"$textoRecibido\"")
             enviarTextoParaAnalizar(textoRecibido)
         } else {
-            // Al iniciar por primera vez, el estado inicial es SEGURO (0%)
-            Log.d(TAG, "🛡️ [ANDROID LOG]: Protección activa. Estado inicial: SEGURO (0%).")
+            // 👈 Cambiamos el texto por defecto al iniciar la protección
+            Log.d(TAG, "🛡️ [ANDROID LOG]: Protección activa. Esperando audio/texto...")
             updateOverlayUI(
                 VishingResponse(
-                    nivel_riesgo = "BAJO",
+                    nivel_riesgo = "INICIAL",
                     score = 0,
-                    recomendacion = "Escaneando llamada... No se detectan amenazas."
+                    recomendacion = "Escaneando llamada en tiempo real..."
                 )
             )
         }
@@ -132,7 +143,7 @@ class OverlayService : Service() {
         )
 
         params.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-        params.y = 100
+        params.y = 90
 
         windowManager.addView(overlayView, params)
         Log.d(TAG, "🎨 [ANDROID LOG]: Tarjeta Flotante (Overlay) inflada y colocada en pantalla.")
@@ -140,7 +151,7 @@ class OverlayService : Service() {
 
     // 🚀 Petición HTTP POST con Logs hacia FastAPI
     fun enviarTextoParaAnalizar(textoLlamada: String) {
-        val urlServer = "http://localhost:8000/analizar-llamada"
+        val urlServer = "http://10.170.195.216:8000/analizar-llamada"
         Log.i(TAG, "🌐 [ANDROID LOG]: Conectando a $urlServer...")
         Log.i(TAG, "📤 [ENVIANDO TEXTO]: \"$textoLlamada\"")
 
@@ -188,30 +199,55 @@ class OverlayService : Service() {
     private fun updateOverlayUI(data: VishingResponse) {
         Handler(Looper.getMainLooper()).post {
             val score = data.score ?: 0
-            val nivel = data.nivel_riesgo?.uppercase() ?: "PELIGROSO"
+            val nivelRecibido = data.nivel_riesgo?.uppercase() ?: "INICIAL"
 
-            Log.i(TAG, "🎨 [ANDROID LOG]: Actualizando Interfaz Móvil -> Riesgo: $nivel | Score: $score%")
+            Log.i(TAG, "🎨 [ANDROID LOG]: Actualizando Interfaz Móvil -> Riesgo: $nivelRecibido | Score: $score%")
 
             tvScore.text = "$score%"
-            tvRecommendation.text = data.recomendacion ?: "Analizando llamada..."
 
-            when (nivel) {
-                "BAJO", "SEGURO" -> {
-                    container.setBackgroundColor(Color.parseColor("#2E7D32")) // Verde 🟢
-                    tvShieldStatus.text = "🛡️ Llamada Segura"
-                }
-                "MEDIO", "SOSPECHOSO" -> {
-                    container.setBackgroundColor(Color.parseColor("#E65100")) // Naranja 🟠
-                    tvShieldStatus.text = "⚠️ Sospecha Detectada"
-                }
-                "PELIGROSO", "FRAUDE" -> {
-                    container.setBackgroundColor(Color.parseColor("#C62828")) // Rojo 🛑
-                    tvShieldStatus.text = "🛑 ALERTA DE FRAUDE"
-                }
-                else -> {
-                    container.setBackgroundColor(Color.parseColor("#C62828"))
-                    tvShieldStatus.text = "🛑 ALERTA DE FRAUDE"
-                }
+            // 1. Asignamos la forma redondeada del drawable
+            container.setBackgroundResource(R.drawable.bg_overlay_card)
+
+            // 2. Evaluamos el color, título y mensaje descriptivo basándonos en el Score
+            val (colorHex, tituloEstado, recomendacionTexto) = when {
+                nivelRecibido == "INICIAL" && score == 0 -> Triple(
+                    "#1B5E20",
+                    "🛡️ VishGuard Activo",
+                    "Escaneando llamada en tiempo real..."
+                )
+                score <= 25 -> Triple(
+                    "#1B5E20",
+                    "🛡️ Llamada Segura",
+                    data.recomendacion ?: "Conversación cotidiana sin indicadores de riesgo."
+                )
+                score in 26..60 -> Triple(
+                    "#E65100",
+                    "⚠️ Sospecha Detectada",
+                    if (data.recomendacion?.contains("segura", ignoreCase = true) == true)
+                        "Precaución: La conversación contiene patrones inusuales o solicitud de datos."
+                    else
+                        (data.recomendacion ?: "Precaución: Valide la identidad del interlocutor.")
+                )
+                score > 60 -> Triple(
+                    "#B71C1C",
+                    "🛑 ALERTA DE FRAUDE",
+                    data.recomendacion ?: "¡Peligro! No proporcione claves, códigos SMS ni datos bancarios."
+                )
+                else -> Triple(
+                    "#1B5E20",
+                    "🛡️ VishGuard Activo",
+                    "Escaneando llamada..."
+                )
+            }
+
+            tvShieldStatus.text = tituloEstado
+            tvRecommendation.text = recomendacionTexto
+
+            // 3. Aplicamos la tinta respetando los bordes redondeados
+            container.background?.let { backgroundDrawable ->
+                val wrappedDrawable = androidx.core.graphics.drawable.DrawableCompat.wrap(backgroundDrawable).mutate()
+                androidx.core.graphics.drawable.DrawableCompat.setTint(wrappedDrawable, Color.parseColor(colorHex))
+                container.background = wrappedDrawable
             }
         }
     }
