@@ -1,5 +1,6 @@
 package com.vishguard.ai.services
 
+import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -8,6 +9,9 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -23,19 +27,22 @@ import androidx.core.app.NotificationCompat
 import com.google.gson.Gson
 import com.vishguard.ai.R
 import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
+import okio.ByteString.Companion.toByteString
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 
-// Data class ajustada para mapear la respuesta de Groq / Heurística local
-data class VishingResponse(
+// Data Classes para desempaquetar la respuesta JSON del WebSocket
+data class AnalisisIA(
     val nivel_riesgo: String? = null,
-    val color: String? = null,
+    val score: Int? = 0,
     val mensaje_alerta: String? = null,
-    val recomendacion: String? = null,
-    val patron_detectado: String? = null,
-    val score: Int? = 0
+    val recomendacion: String? = null
+)
+
+data class WebSocketResponse(
+    val texto_detectado: String? = null,
+    val transcripcion_completa: String? = null,
+    val analisis: AnalisisIA? = null
 )
 
 class OverlayService : Service() {
@@ -47,46 +54,39 @@ class OverlayService : Service() {
     private lateinit var tvScore: TextView
     private lateinit var tvRecommendation: TextView
 
-    // ⏱️ Cliente HTTP configurado con Timeouts extendidos para la fase de pruebas
+    // WebSocket / Network
     private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS) // Conexión a la red local
-        .readTimeout(15, TimeUnit.SECONDS)    // Tiempo de espera para la inferencia de la IA
-        .writeTimeout(15, TimeUnit.SECONDS)   // Envío de la petición
+        .readTimeout(0, TimeUnit.MILLISECONDS) // Mantener WebSocket vivo sin timeouts
         .build()
-
+    private var webSocket: WebSocket? = null
     private val gson = Gson()
-    private val TAG = "VishGuardHTTP"
 
-    companion object {
-        const val EXTRA_TEXTO = "extra_texto_llamada"
-    }
+    // Grabación AudioRecord
+    private var isRecording = false
+    private var audioRecord: AudioRecord? = null
+    private var recordingThread: Thread? = null
+
+    private val sampleRate = 16000 // 16kHz ideal para STT
+    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+    private val TAG = "VishGuardOverlay"
+    // IP de tu servidor backend FastAPI
+    private val WS_URL = "ws://10.155.14.216:8000/ws/stream-audio"
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "🚀 [ANDROID LOG]: Servicio OverlayService creado correctamente.")
+        Log.d(TAG, "🚀 [ANDROID LOG]: OverlayService creado. Iniciando servicio y UI...")
         startForegroundServiceNotification()
         setupOverlayWindow()
+        conectarWebSocket()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val textoRecibido = intent?.getStringExtra(EXTRA_TEXTO)
-
-        if (!textoRecibido.isNullOrBlank()) {
-            Log.d(TAG, "📞 [ANDROID LOG]: Frase enviada para análisis: \"$textoRecibido\"")
-            enviarTextoParaAnalizar(textoRecibido)
-        } else {
-            // 👈 Cambiamos el texto por defecto al iniciar la protección
-            Log.d(TAG, "🛡️ [ANDROID LOG]: Protección activa. Esperando audio/texto...")
-            updateOverlayUI(
-                VishingResponse(
-                    nivel_riesgo = "INICIAL",
-                    score = 0,
-                    recomendacion = "Escaneando llamada en tiempo real..."
-                )
-            )
-        }
+        Log.d(TAG, "🎙️ [ANDROID LOG]: Iniciando la captura continua de audio...")
+        iniciarAudioRecord()
         return START_STICKY
     }
 
@@ -99,7 +99,7 @@ class OverlayService : Service() {
                 NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            manager?.createNotificationChannel(channel)
         }
 
         val notification = NotificationCompat.Builder(this, channelId)
@@ -109,7 +109,13 @@ class OverlayService : Service() {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(
+                1,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(1, notification)
         }
@@ -146,104 +152,125 @@ class OverlayService : Service() {
         params.y = 90
 
         windowManager.addView(overlayView, params)
-        Log.d(TAG, "🎨 [ANDROID LOG]: Tarjeta Flotante (Overlay) inflada y colocada en pantalla.")
+        Log.d(TAG, "🎨 [ANDROID LOG]: Tarjeta Flotante (Overlay) lista en pantalla.")
     }
 
-    // 🚀 Petición HTTP POST con Logs hacia FastAPI
-    fun enviarTextoParaAnalizar(textoLlamada: String) {
-        val urlServer = "http://10.170.195.216:8000/analizar-llamada"
-        Log.i(TAG, "🌐 [ANDROID LOG]: Conectando a $urlServer...")
-        Log.i(TAG, "📤 [ENVIANDO TEXTO]: \"$textoLlamada\"")
+    // ⚡ Inicialización y gestión del WebSocket
+    private fun conectarWebSocket() {
+        val request = Request.Builder().url(WS_URL).build()
+        Log.i(TAG, "⚡ [WEBSOCKET]: Conectando a $WS_URL...")
 
-        // Feedback inmediato en pantalla mientras responde la IA
-        Handler(Looper.getMainLooper()).post {
-            tvShieldStatus.text = "🔍 Analizando intención..."
-            tvRecommendation.text = "Procesando mensaje con el cerebro de IA..."
-        }
-
-        val jsonBody = mapOf("texto" to textoLlamada)
-        val bodyString = gson.toJson(jsonBody)
-        val body = bodyString.toRequestBody("application/json; charset=utf-8".toMediaType())
-
-        val request = Request.Builder()
-            .url(urlServer)
-            .post(body)
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "❌ [ANDROID LOG ERROR]: Falló la conexión con el servidor: ${e.message}")
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                Log.d(TAG, "✅ [WEBSOCKET]: Conexión establecida exitosamente con el backend.")
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                val responseData = response.body?.string()
-                if (response.isSuccessful && responseData != null) {
-                    Log.d(TAG, "✅ [ANDROID LOG]: ¡Conexión Exitosa con la PC! Respuesta recibida:")
-                    Log.d(TAG, "📩 [JSON RECIBIDO]: $responseData")
-
-                    try {
-                        val resultado = gson.fromJson(responseData, VishingResponse::class.java)
-                        if (resultado != null) {
-                            updateOverlayUI(resultado)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "❌ [ANDROID LOG ERROR]: Error al mapear el JSON: ${e.message}")
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                Log.d(TAG, "📩 [WEBSOCKET RECIBIDO]: $text")
+                try {
+                    val responseObj = gson.fromJson(text, WebSocketResponse::class.java)
+                    responseObj.analisis?.let { analisis ->
+                        updateOverlayUI(analisis, responseObj.texto_detectado)
                     }
-                } else {
-                    Log.e(TAG, "⚠️ [ANDROID LOG ERROR]: Servidor respondió con código de error: ${response.code}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ Error procesando el JSON del WebSocket: ${e.message}")
                 }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e(TAG, "❌ [WEBSOCKET ERROR]: Fallo en la conexión: ${t.message}")
+            }
+
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                Log.w(TAG, "⚠ [WEBSOCKET]: Cerrando conexión ($code): $reason")
             }
         })
     }
 
-    private fun updateOverlayUI(data: VishingResponse) {
-        Handler(Looper.getMainLooper()).post {
-            val score = data.score ?: 0
-            val nivelRecibido = data.nivel_riesgo?.uppercase() ?: "INICIAL"
+    // 🎙️ Captura de Audio continua optimizada para llamadas
+    @SuppressLint("MissingPermission")
+    private fun iniciarAudioRecord() {
+        if (isRecording) return
 
-            Log.i(TAG, "🎨 [ANDROID LOG]: Actualizando Interfaz Móvil -> Riesgo: $nivelRecibido | Score: $score%")
+        val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+        // 🎯 VOICE_COMMUNICATION activa la supresión de eco del sistema para priorizar el audio entrante
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            sampleRate,
+            channelConfig,
+            audioFormat,
+            minBufferSize
+        )
+
+        isRecording = true
+        audioRecord?.startRecording()
+
+        recordingThread = Thread {
+            val buffer = ByteArray(2048)
+            val chunkStream = ByteArrayOutputStream()
+
+            val chunkDurationMs = 3000 // Ráfaga cada 3 segundos
+            val bytesPerSecond = sampleRate * 2 // 16-bit PCM = 2 bytes por sample
+            val targetChunkSize = bytesPerSecond * (chunkDurationMs / 1000)
+
+            while (isRecording) {
+                val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: 0
+                if (readBytes > 0) {
+                    chunkStream.write(buffer, 0, readBytes)
+
+                    // Al acumular ~3 segundos de audio, se despacha por el WebSocket
+                    if (chunkStream.size() >= targetChunkSize) {
+                        val audioChunk = chunkStream.toByteArray()
+                        Log.d(TAG, "📤 [ENVIANDO AUDIO CHUNK]: ${audioChunk.size} bytes enviado por WS.")
+
+                        webSocket?.send(audioChunk.toByteString())
+                        chunkStream.reset()
+                    }
+                }
+            }
+        }
+        recordingThread?.start()
+    }
+
+    // 🎨 Actualización en vivo de la tarjeta flotante en pantalla
+    private fun updateOverlayUI(analisis: AnalisisIA, textoDetectado: String?) {
+        Handler(Looper.getMainLooper()).post {
+            val score = analisis.score ?: 0
+            val nivelRecibido = analisis.nivel_riesgo?.uppercase() ?: "BAJO"
+
+            Log.i(TAG, "🎨 [ANDROID UI]: Riesgo: $nivelRecibido | Score: $score% | Transcrito: \"$textoDetectado\"")
 
             tvScore.text = "$score%"
-
-            // 1. Asignamos la forma redondeada del drawable
             container.setBackgroundResource(R.drawable.bg_overlay_card)
 
-            // 2. Evaluamos el color, título y mensaje descriptivo basándonos en el Score
             val (colorHex, tituloEstado, recomendacionTexto) = when {
-                nivelRecibido == "INICIAL" && score == 0 -> Triple(
-                    "#1B5E20",
-                    "🛡️ VishGuard Activo",
-                    "Escaneando llamada en tiempo real..."
-                )
-                score <= 25 -> Triple(
+                nivelRecibido == "BAJO" && score <= 25 -> Triple(
                     "#1B5E20",
                     "🛡️ Llamada Segura",
-                    data.recomendacion ?: "Conversación cotidiana sin indicadores de riesgo."
+                    analisis.recomendacion ?: "Conversación cotidiana sin indicadores de riesgo."
                 )
-                score in 26..60 -> Triple(
+                nivelRecibido == "MEDIO" || score in 26..60 -> Triple(
                     "#E65100",
                     "⚠️ Sospecha Detectada",
-                    if (data.recomendacion?.contains("segura", ignoreCase = true) == true)
-                        "Precaución: La conversación contiene patrones inusuales o solicitud de datos."
-                    else
-                        (data.recomendacion ?: "Precaución: Valide la identidad del interlocutor.")
+                    analisis.mensaje_alerta ?: analisis.recomendacion ?: "Precaución: Se detectan preguntas o patrones inusuales."
                 )
-                score > 60 -> Triple(
+                nivelRecibido == "PELIGROSO" || score > 60 -> Triple(
                     "#B71C1C",
                     "🛑 ALERTA DE FRAUDE",
-                    data.recomendacion ?: "¡Peligro! No proporcione claves, códigos SMS ni datos bancarios."
+                    analisis.mensaje_alerta ?: "¡Peligro! No proporcione claves, códigos SMS ni datos bancarios."
                 )
                 else -> Triple(
                     "#1B5E20",
                     "🛡️ VishGuard Activo",
-                    "Escaneando llamada..."
+                    "Escaneando llamada en tiempo real..."
                 )
             }
 
             tvShieldStatus.text = tituloEstado
             tvRecommendation.text = recomendacionTexto
 
-            // 3. Aplicamos la tinta respetando los bordes redondeados
+            // Tinta dinámica para los bordes/fondo de la tarjeta según el peligro
             container.background?.let { backgroundDrawable ->
                 val wrappedDrawable = androidx.core.graphics.drawable.DrawableCompat.wrap(backgroundDrawable).mutate()
                 androidx.core.graphics.drawable.DrawableCompat.setTint(wrappedDrawable, Color.parseColor(colorHex))
@@ -252,8 +279,24 @@ class OverlayService : Service() {
         }
     }
 
+    private fun detenerAudioRecord() {
+        isRecording = false
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioRecord = null
+            recordingThread?.interrupt()
+            recordingThread = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Error al detener AudioRecord: ${e.message}")
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        Log.d(TAG, "🛑 Deteniendo OverlayService y cerrando socket...")
+        detenerAudioRecord()
+        webSocket?.close(1000, "Llamada o Servicio finalizado")
         overlayView?.let {
             windowManager.removeView(it)
             overlayView = null

@@ -51,10 +51,10 @@
         android:id="@+id/tvRecommendation"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:lineSpacingExtra="2dp"
         android:text="Escaneando conversación en tiempo real..."
         android:textColor="#E0E0E0"
-        android:textSize="13sp"
-        android:lineSpacingExtra="2dp" />
+        android:textSize="13sp" />
 
 
 </LinearLayout>
